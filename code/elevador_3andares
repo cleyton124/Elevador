@@ -1,0 +1,353 @@
+// ======== BIBLIOTECAS ========
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Servo.h>
+
+// Inicializa o LCD I2C (endereço 0x27, 16 colunas, 2 linhas)
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Inicializa o Servo Motor
+Servo servoPorta;
+
+// ======== DEFINIÇÕES DE PINOS ========
+#define IN1 5   // controle do motor (subida)
+#define IN2 6   // controle do motor (descida)
+#define SERVO_PIN 13  // pino do servo motor da porta
+#define BUZZER_PIN A2 // pino do buzzer
+
+// Botões internos e externos
+const int botoesInternos[]  = {7, 8, 9};   // dentro do elevador
+const int botoesExternos[]  = {4, 3, 2};   // fora do elevador
+
+// Sensores
+const int sensores[] = {10, 11, 12};
+const int totalAndares = 3;
+
+// ======== ÂNGULOS DO SERVO ========
+const int PORTA_FECHADA = 0;    // 0 graus = porta fechada
+const int PORTA_ABERTA = 90;    // 90 graus = porta aberta
+
+// ======== VARIÁVEIS ========
+int andarAtual = 1;
+int andarDestino = 0;
+int fila[totalAndares] = {0, 0, 0};
+int sentido = 0; // -1 = descendo, 0 = parado, 1 = subindo
+
+// ======== MOTOR ========
+int velSubida = 200;
+int velDescida = 200;
+
+// ======== ESTADOS ========
+enum Estado {
+  PARADO,
+  SUBINDO,
+  DESCENDO,
+  ABRINDO_PORTA,
+  FECHANDO_PORTA
+};
+Estado estadoAtual = PARADO;
+
+// ======== SETUP ========
+void setup() {
+  Serial.begin(9600);
+  
+  // Inicializa o LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  
+  // Inicializa o Servo Motor
+  servoPorta.attach(SERVO_PIN);
+  servoPorta.write(PORTA_FECHADA);  // Inicia com a porta fechada
+  
+  // Inicializa o Buzzer
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  
+  // Mensagem inicial
+  lcd.setCursor(0, 0);
+  lcd.print("  ELEVADOR");
+  lcd.setCursor(0, 1);
+  lcd.print(" INTELIGENTE");
+  
+  // Bip de inicialização
+  tone(BUZZER_PIN, 1000, 200);
+  delay(2000);
+  
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+
+  for (int i = 0; i < totalAndares; i++) {
+    pinMode(botoesInternos[i], INPUT_PULLUP);
+    pinMode(botoesExternos[i], INPUT_PULLUP);
+    pinMode(sensores[i], INPUT_PULLUP);
+  }
+
+  Serial.println("=== ELEVADOR INTELIGENTE — BOTÕES INTERNOS E EXTERNOS ===");
+  Serial.println("Elevador iniciado no 1º andar");
+  
+  atualizarDisplayParado();
+}
+
+// ======== LOOP PRINCIPAL ========
+void loop() {
+  lerBotoes();
+  atualizarAndarAtual();
+  processarEstado();
+  delay(100);
+}
+
+// ======== LEITURA DE BOTÕES ========
+void lerBotoes() {
+  for (int i = 0; i < totalAndares; i++) {
+    if (digitalRead(botoesInternos[i]) == LOW || digitalRead(botoesExternos[i]) == LOW) {
+      fila[i] = 1;
+      Serial.print("Chamado registrado para o ");
+      Serial.print(i + 1);
+      Serial.println("º andar.");
+      
+      // Bip de confirmação
+      tone(BUZZER_PIN, 1500, 100);
+      
+      // Mostra no LCD
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Chamado:");
+      lcd.setCursor(0, 1);
+      lcd.print("Andar ");
+      lcd.print(i + 1);
+      delay(800);
+      
+      delay(200);
+    }
+  }
+}
+
+// ======== ATUALIZA ANDAR ATUAL ========
+void atualizarAndarAtual() {
+  for (int i = 0; i < totalAndares; i++) {
+    if (digitalRead(sensores[i]) == LOW) {
+      andarAtual = i + 1;
+    }
+  }
+}
+
+// ======== PROCESSAMENTO DE ESTADOS ========
+void processarEstado() {
+  switch (estadoAtual) {
+    case PARADO:
+      definirProximoDestino();
+      if (andarDestino > andarAtual) {
+        estadoAtual = SUBINDO;
+        subir();
+      } else if (andarDestino < andarAtual) {
+        estadoAtual = DESCENDO;
+        descer();
+      }
+      break;
+
+    case SUBINDO:
+      if (digitalRead(sensores[andarDestino - 1]) == LOW) {
+        pararMotor();
+        estadoAtual = ABRINDO_PORTA;
+      }
+      break;
+
+    case DESCENDO:
+      if (digitalRead(sensores[andarDestino - 1]) == LOW) {
+        pararMotor();
+        estadoAtual = ABRINDO_PORTA;
+      }
+      break;
+
+    case ABRINDO_PORTA:
+      abrirPorta();
+      estadoAtual = FECHANDO_PORTA;
+      break;
+
+    case FECHANDO_PORTA:
+      fecharPorta();
+      fila[andarAtual - 1] = 0; // zera o chamado atendido
+      estadoAtual = PARADO;
+      atualizarDisplayParado();
+      break;
+  }
+}
+
+// ======== DEFINE O PRÓXIMO DESTINO COM PRIORIDADE DE DIREÇÃO ========
+void definirProximoDestino() {
+  if (!existeChamado()) {
+    andarDestino = andarAtual;
+    sentido = 0;
+    return;
+  }
+
+  // Determina direção se estiver parado
+  if (sentido == 0) {
+    for (int i = 0; i < totalAndares; i++) {
+      if (fila[i]) {
+        sentido = (i + 1 > andarAtual) ? 1 : -1;
+        break;
+      }
+    }
+  }
+
+  // === PRIORIZAÇÃO POR DIREÇÃO ===
+  if (sentido == 1) { // Subindo
+    // Procura o próximo andar acima com chamado
+    for (int i = andarAtual - 1; i < totalAndares; i++) {
+      if (fila[i]) {
+        andarDestino = i + 1;
+        return;
+      }
+    }
+    // Se não tiver mais acima, muda sentido para descer
+    sentido = -1;
+  }
+
+  if (sentido == -1) { // Descendo
+    // Procura o próximo andar abaixo com chamado
+    for (int i = andarAtual - 2; i >= 0; i--) {
+      if (fila[i]) {
+        andarDestino = i + 1;
+        return;
+      }
+    }
+    // Se não tiver mais abaixo, muda sentido para subir
+    sentido = 1;
+  }
+
+  // Se não encontrou nada no sentido atual, tenta novamente no outro
+  definirProximoDestino();
+}
+
+// ======== VERIFICA SE EXISTE CHAMADO ========
+bool existeChamado() {
+  for (int i = 0; i < totalAndares; i++) {
+    if (fila[i]) return true;
+  }
+  return false;
+}
+
+// ======== MOTOR ========
+void subir() {
+  Serial.print("Subindo para o ");
+  Serial.print(andarDestino);
+  Serial.println("º andar...");
+  
+  // Atualiza LCD
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("   SUBINDO");
+  lcd.setCursor(0, 1);
+  lcd.print("Andar ");
+  lcd.print(andarAtual);
+  lcd.print(" -> ");
+  lcd.print(andarDestino);
+  
+  analogWrite(IN1, velSubida);
+  analogWrite(IN2, LOW);
+}
+
+void descer() {
+  Serial.print("Descendo para o ");
+  Serial.print(andarDestino);
+  Serial.println("º andar...");
+  
+  // Atualiza LCD
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("  DESCENDO");
+  lcd.setCursor(0, 1);
+  lcd.print("Andar ");
+  lcd.print(andarAtual);
+  lcd.print(" -> ");
+  lcd.print(andarDestino);
+  
+  analogWrite(IN1, LOW);
+  analogWrite(IN2, velDescida);
+}
+
+void pararMotor() {
+  analogWrite(IN1, LOW);
+  analogWrite(IN2, LOW);
+  
+  Serial.print("Elevador chegou ao ");
+  Serial.print(andarDestino);
+  Serial.println("º andar.");
+  
+  // Bip de chegada - 2 bips rápidos
+  tone(BUZZER_PIN, 2000, 150);
+  delay(200);
+  tone(BUZZER_PIN, 2000, 150);
+  delay(200);
+  
+  // Atualiza LCD
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("   CHEGOU!");
+  lcd.setCursor(0, 1);
+  lcd.print("   Andar ");
+  lcd.print(andarDestino);
+  delay(1000);
+}
+
+// ======== PORTAS ========
+void abrirPorta() {
+  Serial.println("Abrindo porta...");
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(" ABRINDO PORTA");
+  lcd.setCursor(0, 1);
+  lcd.print("================");
+  
+  // Som de abertura da porta
+  tone(BUZZER_PIN, 800, 200);
+  delay(250);
+  tone(BUZZER_PIN, 1000, 200);
+  
+  // Abre a porta suavemente
+  for (int pos = PORTA_FECHADA; pos <= PORTA_ABERTA; pos++) {
+    servoPorta.write(pos);
+    delay(15);  // Movimento suave
+  }
+  
+  delay(1500);  // Porta fica aberta
+}
+
+void fecharPorta() {
+  Serial.println("Fechando porta...");
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("FECHANDO PORTA");
+  lcd.setCursor(0, 1);
+  lcd.print("================");
+  
+  // Alerta sonoro antes de fechar
+  tone(BUZZER_PIN, 600, 300);
+  delay(400);
+  
+  // Fecha a porta suavemente
+  for (int pos = PORTA_ABERTA; pos >= PORTA_FECHADA; pos--) {
+    servoPorta.write(pos);
+    delay(15);  // Movimento suave
+  }
+  
+  // Bip de porta fechada
+  tone(BUZZER_PIN, 800, 150);
+  
+  delay(1000);
+  Serial.println("porta fechada");
+}
+
+// ======== ATUALIZA DISPLAY PARADO ========
+void atualizarDisplayParado() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("   PARADO");
+  lcd.setCursor(0, 1);
+  lcd.print("   Andar ");
+  lcd.print(andarAtual);
+}
